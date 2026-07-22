@@ -1,6 +1,8 @@
 """
 processing.py — source cleaning functions. One home for all file processing.
-Currently: load_register(). Bonds / consents / population added here as we go.
+  load_register()   -> MSD housing register (quarterly panel of counts)
+  load_population()  -> Stats NZ subnational population (annual, 30 June)
+Bonds / consents added here as we go.
 """
 import re
 import pandas as pd
@@ -10,19 +12,22 @@ import config
 from ta_registry import normalise, CANONICAL_TAS
 import validate as V
 
+# ───────────────── shared helpers ─────────────────
 _MONTH_Q = {"Mar": 1, "Jun": 2, "Sep": 3, "Dec": 4}
 
 def _parse_quarter(label):
-    """'Mar-16' -> pandas Period 2016Q1."""
     mon, yy = label.split("-")
     return pd.Period(f"{2000 + int(yy)}Q{_MONTH_Q[mon.strip()]}", freq="Q")
 
+def _display(key):
+    return CANONICAL_TAS.get(key, key)
+
+# ───────────────── register ─────────────────
 def _is_junk(name):
     r = str(name).replace("\xa0", " ").strip()
     return r == "" or r.startswith(config.REGISTER_JUNK_PREFIXES)
 
 def _clean_count(raw):
-    """(value, suppressed). 'S' -> (NA, True); real 0 kept; commas stripped."""
     if raw is None:
         return (pd.NA, False)
     s = str(raw).replace("\xa0", " ").strip()
@@ -37,7 +42,6 @@ def _clean_count(raw):
         return (pd.NA, False)
 
 def _read_ta_summary(path, vintage):
-    """One register workbook's 'TA summary' sheet -> tidy long frame."""
     ws = openpyxl.load_workbook(path, read_only=True, data_only=True)["TA summary"]
     rows = list(ws.iter_rows(values_only=True))
     hdr = next(i for i, r in enumerate(rows) if r and r[1] and str(r[1]).strip() == "TA")
@@ -53,10 +57,9 @@ def _read_ta_summary(path, vintage):
         key = normalise(name)
         if key is None:
             continue
-        disp = CANONICAL_TAS.get(key, str(name).strip())
         for j, q in qcols:
             val, supp = _clean_count(r[j])
-            recs.append((key, disp, q, val, supp, vintage))
+            recs.append((key, _display(key), q, val, supp, vintage))
     df = pd.DataFrame(recs, columns=["ta_key", "ta_name", "quarter",
                                      "register_count", "suppressed", "vintage"])
     df["register_count"] = df["register_count"].astype("Int64")
@@ -73,11 +76,8 @@ def _assert_complete_panel(df):
         raise V.ValidationError("register: some TAs are missing quarters")
 
 def load_register():
-    """Read both vintages, seam-check the overlap, merge (most-recent-wins),
-    validate a complete 66-TA panel. Returns (panel_df, seam_df)."""
     d21 = _read_ta_summary(config.REGISTER_2021, 2021)
     d26 = _read_ta_summary(config.REGISTER_2026, 2026)
-
     overlap = sorted(set(d21["quarter"]) & set(d26["quarter"]))
     a = (d21[d21["quarter"].isin(overlap)][["ta_key", "quarter", "register_count"]]
          .rename(columns={"register_count": "v2021"}))
@@ -85,16 +85,47 @@ def load_register():
          .rename(columns={"register_count": "v2026"}))
     seam = a.merge(b, on=["ta_key", "quarter"])
     seam["diff"] = seam["v2026"] - seam["v2021"]
-
     df = (pd.concat([d21[~d21["quarter"].isin(overlap)], d26], ignore_index=True)
             .sort_values(["ta_key", "quarter"]).reset_index(drop=True))
     _assert_complete_panel(df)
     return df, seam
 
 def save_register_xlsx(df, path):
-    """Write to Excel. Suppressed cells stay blank; the 'suppressed' column is
-    the unambiguous record. Real zeros are preserved as 0."""
     out = df.copy()
     out["quarter"] = out["quarter"].astype(str)
     out.to_excel(path, index=False)
+    return path
+
+# ───────────────── population ─────────────────
+def _assert_complete_annual(df):
+    n_y = df["year"].nunique()
+    if df.duplicated(["ta_key", "year"]).any():
+        raise V.ValidationError("population: duplicate TA-year rows")
+    if not (df.groupby("year")["ta_key"].nunique() == config.N_TAS).all():
+        raise V.ValidationError("population: some years lack all 66 TAs")
+    if not (df.groupby("ta_key")["year"].nunique() == n_y).all():
+        raise V.ValidationError("population: some TAs are missing years")
+    if (df["population"] <= 0).any():
+        raise V.ValidationError("population: non-positive population found")
+
+def load_population():
+    """Stats NZ subnational population (POPES_SUB_006), 30 June estimates.
+    Faithful annual clean-up: one row per TA-year. Quarterly expansion and
+    demand_rate are deferred to panel assembly."""
+    p = pd.read_csv(config.POPULATION, encoding="utf-8")
+    p = p.rename(columns={"Year at 30 June": "year", "OBS_VALUE": "population"})
+    p = p[["year", "Area", "population"]].copy()
+    p = p[~p["Area"].isin(config.POPULATION_DROP)].copy()
+    p["ta_key"] = p["Area"].map(normalise)
+    p["ta_name"] = p["ta_key"].map(_display)
+    p = (p[["ta_key", "ta_name", "year", "population"]]
+         .sort_values(["ta_key", "year"]).reset_index(drop=True))
+    p["population"] = p["population"].astype("int64")
+    p["year"] = p["year"].astype(int)
+    V.assert_ta_set(p["ta_key"].unique(), "population")
+    _assert_complete_annual(p)
+    return p
+
+def save_population_xlsx(df, path):
+    df.to_excel(path, index=False)
     return path
