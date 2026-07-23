@@ -3,7 +3,7 @@ processing.py — source cleaning functions. One home for all file processing.
   load_register()    -> MSD housing register (quarterly panel of counts)
   load_population()  -> Stats NZ subnational population (annual, 30 June)
   load_bonds()       -> Tenancy Services bond/rent (quarterly TA panel)
-Consents added here next.
+  load_consents()    -> Stats NZ building consents (quarterly TA panel)
 """
 import re
 import numpy as np
@@ -129,11 +129,11 @@ def save_population_xlsx(df, path):
 # ───────────────── bonds ─────────────────
 _BOND_NUMS = ["Lodged Bonds", "Active Bonds", "Closed Bonds",
               "Geometric Mean Rent", "Log Std Dev Weekly Rent"]
-_BOND_LAG_RUNWAY = 4   # extra quarters kept before PANEL_START, for lagged predictors later
+_BOND_LAG_RUNWAY = 4
 
 def _bond_window():
-    end = pd.Period(config.PANEL_END, freq="Q")                        # 2025Q3 (migration cutoff)
-    start = pd.Period(config.PANEL_START, freq="Q") - _BOND_LAG_RUNWAY  # a year of lag runway
+    end = pd.Period(config.PANEL_END, freq="Q")
+    start = pd.Period(config.PANEL_START, freq="Q") - _BOND_LAG_RUNWAY
     return start, end
 
 def _assert_complete_bond_panel(df):
@@ -150,11 +150,6 @@ def _assert_complete_bond_panel(df):
         raise V.ValidationError("bonds: non-positive active bonds")
 
 def load_bonds():
-    """Monthly bond/rent -> quarterly TA panel. Flows summed; active bonds =
-    quarter-end; rent = geometric mean of the quarter's months; dispersion =
-    mean of months. Missing TA-months: flows->0 (source omits zero-activity
-    rows), rent->NaN (no observation), active->carry-forward. Truncated at the
-    migration cutoff (config.PANEL_END)."""
     start_q, end_q = _bond_window()
     b = pd.read_csv(config.BONDS)
     b = b[~b["Location Id"].isin(config.BOND_SENTINELS)].copy()
@@ -174,7 +169,7 @@ def load_bonds():
         log_std_dev_rent=("Log Std Dev Weekly Rent", "mean"),
         n_months=("month", "nunique"),
     )
-    agg["geom_mean_rent"] = np.exp(g["_logrent"].mean())              # geometric mean of the quarter
+    agg["geom_mean_rent"] = np.exp(g["_logrent"].mean())
     last = (b.loc[g["month"].idxmax(), ["ta_key", "quarter", "Active Bonds"]]
               .set_index(["ta_key", "quarter"])["Active Bonds"].rename("active_bonds"))
     agg = agg.join(last).reset_index()
@@ -182,12 +177,11 @@ def load_bonds():
     quarters = pd.period_range(start_q, end_q, freq="Q")
     full = pd.MultiIndex.from_product([sorted(CANONICAL_TAS), quarters], names=["ta_key", "quarter"])
     q = agg.set_index(["ta_key", "quarter"]).reindex(full).reset_index()
-    q["lodged_bonds"] = q["lodged_bonds"].fillna(0).astype("int64")   # absence = no activity
+    q["lodged_bonds"] = q["lodged_bonds"].fillna(0).astype("int64")
     q["closed_bonds"] = q["closed_bonds"].fillna(0).astype("int64")
     q["n_months"]     = q["n_months"].fillna(0).astype("int64")
     q["active_bonds"] = (q.groupby("ta_key")["active_bonds"].ffill().bfill()
-                          .round().astype("Int64"))                   # stock carries forward
-    # geom_mean_rent, log_std_dev_rent left NaN where a quarter had no activity
+                          .round().astype("Int64"))
     q["ta_name"] = q["ta_key"].map(_display)
     q = (q[["ta_key", "ta_name", "quarter", "geom_mean_rent", "log_std_dev_rent",
             "lodged_bonds", "active_bonds", "closed_bonds", "n_months"]]
@@ -196,5 +190,76 @@ def load_bonds():
     return q
 
 def save_bonds_xlsx(df, path):
+    out = df.copy(); out["quarter"] = out["quarter"].astype(str)
+    out.to_excel(path, index=False); return path
+
+# ───────────────── consents ─────────────────
+_CONSENT_TYPES = {"Dwelling units": "dwelling_units",
+                  "Houses": "houses",
+                  "Apartments, townhouses, units, and other dwellings": "apartments"}
+
+def _assert_complete_consents_panel(df):
+    n_q = df["quarter"].nunique()
+    if df.duplicated(["ta_key", "quarter"]).any():
+        raise V.ValidationError("consents: duplicate TA-quarter rows")
+    if not (df.groupby("quarter")["ta_key"].nunique() == config.N_TAS).all():
+        raise V.ValidationError("consents: some quarters lack all 66 TAs")
+    if not (df.groupby("ta_key")["quarter"].nunique() == n_q).all():
+        raise V.ValidationError("consents: some TAs are missing quarters")
+    if not (df["dwelling_units"] == df["houses"] + df["apartments"]).all():
+        raise V.ValidationError("consents: dwelling_units != houses + apartments")
+    if (df[["dwelling_units", "houses", "apartments"]] < 0).any().any():
+        raise V.ValidationError("consents: negative counts")
+
+def load_consents():
+    """Building consents (Infoshare nested crosstab) -> quarterly TA panel of
+    new dwelling units (flows summed). Stores raw dwelling/houses/apartments plus
+    multi_unit_share = apartments / dwelling_units (NaN when no dwellings).
+    NOTE: dwelling_units = houses + apartments by construction — never model all
+    three together; use dwelling_units (supply) with multi_unit_share."""
+    raw = pd.read_csv(config.CONSENTS, header=None, dtype=str,
+                      encoding="utf-8-sig", skip_blank_lines=False)
+    ncols = raw.shape[1]
+    ta_ff = raw.iloc[1].copy(); ta_ff.iloc[0] = np.nan
+    ta_ff = ta_ff.replace("", np.nan).ffill()                     # sparse TA names -> forward-filled
+    types = raw.iloc[2].astype(str).str.strip()
+    colmap = {j: (ta_ff.iloc[j], types.iloc[j]) for j in range(1, ncols)}
+    is_data = raw[0].astype(str).str.match(r"20\d\dM\d\d$", na=False)
+    data = raw[is_data].reset_index(drop=True)
+
+    m = data.melt(id_vars=[0], var_name="col", value_name="value").rename(columns={0: "month"})
+    m["ta_raw"] = m["col"].map(lambda j: colmap[j][0])
+    m["type"] = m["col"].map(lambda j: colmap[j][1])
+    m = m.dropna(subset=["ta_raw"])
+    m = m[m["type"].isin(_CONSENT_TYPES)]
+    m = m[~m["ta_raw"].isin(config.CONSENTS_DROP)].copy()
+    m["type"] = m["type"].map(_CONSENT_TYPES)
+    m["value"] = pd.to_numeric(m["value"].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    m["ta_key"] = m["ta_raw"].map(normalise)
+    m["quarter"] = m["month"].map(lambda s: pd.Period(f"{int(s[:4])}Q{(int(s[5:7]) - 1)//3 + 1}", freq="Q"))
+
+    mw = (m.pivot_table(index=["ta_key", "quarter", "month"], columns="type",
+                        values="value", aggfunc="sum").reset_index())
+    q = (mw.groupby(["ta_key", "quarter"])
+           .agg(dwelling_units=("dwelling_units", "sum"),
+                houses=("houses", "sum"),
+                apartments=("apartments", "sum"),
+                n_months=("month", "nunique")).reset_index())
+    q = q[q["n_months"] == 3].copy()                              # complete quarters only
+    start_q, end_q = pd.Period("2015Q2", freq="Q"), pd.Period(config.PANEL_END, freq="Q")
+    q = q[(q["quarter"] >= start_q) & (q["quarter"] <= end_q)].copy()
+    q["multi_unit_share"] = np.where(q["dwelling_units"] > 0,
+                                     q["apartments"] / q["dwelling_units"], np.nan)
+    for c in ["dwelling_units", "houses", "apartments", "n_months"]:
+        q[c] = q[c].astype("int64")
+    q["ta_name"] = q["ta_key"].map(_display)
+    q = (q[["ta_key", "ta_name", "quarter", "dwelling_units", "houses", "apartments",
+            "multi_unit_share", "n_months"]]
+         .sort_values(["ta_key", "quarter"]).reset_index(drop=True))
+    V.assert_ta_set(q["ta_key"].unique(), "consents")
+    _assert_complete_consents_panel(q)
+    return q
+
+def save_consents_xlsx(df, path):
     out = df.copy(); out["quarter"] = out["quarter"].astype(str)
     out.to_excel(path, index=False); return path
