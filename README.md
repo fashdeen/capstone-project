@@ -1,5 +1,5 @@
 # capstone-project
-The title of my project is - **Forecasting Regional Social Housing Demand in New Zealand: An Open-Data Early-Indicator Model to Support Community Housing Providers and Local Planning**
+The title of my project is - **Forecasting Regional Social Housing Demand in New Zealand Using Open Rental-Market Data**
 The source file details as below
 MSD Housing Register (TA summary) - Retrieved on 14th July 2026
   - https://www.msd.govt.nz/documents/about-msd-and-our-work/publications-resources/statistics/housing/2021/housing-register-march-2021.xlsx
